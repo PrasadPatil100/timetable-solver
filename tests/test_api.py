@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from ortools.sat.python import cp_model
 import pytest
 
+from config import DEFAULT_CORS_ORIGINS, ServiceSettings
 import main
 import solver
 from models import (
@@ -61,6 +62,70 @@ def _request():
 
 def _payload():
     return _request().model_dump(mode="json")
+
+
+def test_root_and_health_endpoints():
+    client = TestClient(main.app)
+
+    root_response = client.get("/")
+    health_response = client.get("/health")
+
+    assert root_response.status_code == 200
+    assert root_response.json() == {"message": "Timetable Solver API is running"}
+    assert health_response.status_code == 200
+    assert health_response.json() == {"status": "ok", "service": "timetable-solver"}
+
+
+def test_development_cors_allows_local_frontend_origin():
+    client = TestClient(main.app)
+
+    response = client.options(
+        "/solve",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert "POST" in response.headers["access-control-allow-methods"]
+
+
+def test_cors_does_not_allow_unconfigured_origin():
+    client = TestClient(main.app)
+
+    response = client.options(
+        "/solve",
+        headers={
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_service_settings_load_environment_values():
+    settings = ServiceSettings.from_env(
+        {
+            "SOLVER_HOST": "0.0.0.0",
+            "SOLVER_PORT": "8123",
+            "SOLVER_CORS_ORIGINS": "https://frontend.example, http://localhost:3000/",
+        }
+    )
+
+    assert settings.host == "0.0.0.0"
+    assert settings.port == 8123
+    assert settings.cors_origins == ("https://frontend.example", "http://localhost:3000")
+    assert ServiceSettings.from_env({}).cors_origins == DEFAULT_CORS_ORIGINS
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "not-a-number"])
+def test_service_settings_reject_invalid_port(port):
+    with pytest.raises(ValueError, match="SOLVER_PORT"):
+        ServiceSettings.from_env({"SOLVER_PORT": port})
 
 
 class _FixedStatusSolver:
@@ -163,6 +228,24 @@ def test_post_solve_rejects_explicit_non_two_period_lab_duration():
 def test_post_solve_rejects_invalid_subject_references(reference_field, unknown_id):
     payload = _payload()
     payload["subjects"][0][reference_field] = [unknown_id]
+
+    response = TestClient(main.app).post("/solve", json=payload)
+
+    assert response.status_code == 422
+    assert unknown_id in str(response.json()["detail"])
+
+
+@pytest.mark.parametrize(
+    ("entity", "field", "unknown_id"),
+    [
+        ("faculty", "subject_ids", "S404"),
+        ("laboratories", "required_subject_ids", "S404"),
+        ("laboratories", "eligible_batches", "B404"),
+    ],
+)
+def test_post_solve_rejects_invalid_eligibility_references(entity, field, unknown_id):
+    payload = _payload()
+    payload[entity][0][field] = [unknown_id]
 
     response = TestClient(main.app).post("/solve", json=payload)
 

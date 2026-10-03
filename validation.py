@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from itertools import combinations
 from typing import Iterable
 
 from models import SolverRequest
@@ -145,6 +144,9 @@ def validate_solver_request(request: SolverRequest) -> list[str]:
     for faculty in request.faculty:
         if faculty.max_workload < 0:
             errors.append(f"Faculty {faculty.id} max_workload must not be negative.")
+        unknown_subjects = set(faculty.subject_ids) - subject_ids
+        if unknown_subjects:
+            errors.append(f"Faculty {faculty.id} references unknown subjects: {sorted(unknown_subjects)}.")
         _validate_availability(faculty, "Faculty", working_days, periods_per_day, errors)
         for slot in faculty.unavailable_slots:
             try:
@@ -164,6 +166,12 @@ def validate_solver_request(request: SolverRequest) -> list[str]:
     for laboratory in request.laboratories:
         if laboratory.capacity <= 0:
             errors.append(f"Laboratory {laboratory.id} capacity must be positive.")
+        unknown_subjects = set(laboratory.required_subject_ids) - subject_ids
+        if unknown_subjects:
+            errors.append(f"Laboratory {laboratory.id} references unknown subjects: {sorted(unknown_subjects)}.")
+        unknown_batches = set(laboratory.eligible_batches) - known_batch_ids
+        if unknown_batches:
+            errors.append(f"Laboratory {laboratory.id} references unknown batches: {sorted(unknown_batches)}.")
         _validate_availability(laboratory, "Laboratory", working_days, periods_per_day, errors)
 
     for existing in request.existing_timetable:
