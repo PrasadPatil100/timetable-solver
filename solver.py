@@ -587,14 +587,18 @@ def solve_basic(request: SolverRequest) -> SolverResult:
     solver.parameters.num_search_workers = 1
     status = solver.Solve(model)
 
-    if status == cp_model.UNKNOWN:
-        result_status = "TIME_LIMITED"
+    if status == cp_model.OPTIMAL:
+        result_status = "OPTIMAL"
+    elif status == cp_model.FEASIBLE:
+        result_status = "FEASIBLE"
     elif status == cp_model.INFEASIBLE:
         result_status = "INFEASIBLE"
-    elif status == cp_model.OPTIMAL:
-        result_status = "OPTIMAL"
+    elif status == cp_model.UNKNOWN:
+        result_status = "TIME_LIMITED"
+    elif status == cp_model.MODEL_INVALID:
+        raise RuntimeError("CP-SAT rejected the generated scheduling model.")
     else:
-        result_status = "FEASIBLE"
+        raise RuntimeError("CP-SAT returned an unsupported solver status.")
 
     selected = []
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -604,7 +608,7 @@ def solve_basic(request: SolverRequest) -> SolverResult:
 
     warnings = []
     if result_status == "TIME_LIMITED":
-        warnings.append("Search was time-limited before proving optimality; the best available schedule is returned.")
+        warnings.append("Search timed out before finding a feasible timetable; no activities are returned.")
     if result_status == "INFEASIBLE":
         warnings.append("No feasible timetable could be constructed under the hard constraints.")
 
