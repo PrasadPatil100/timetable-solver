@@ -736,3 +736,160 @@ def test_gap_objective_prefers_compact_schedule_without_backfilling(basic_reques
     assert result.status == "OPTIMAL"
     assert sorted(activity.period for activity in result.activities) == [2, 3]
     assert len(result.activities) == 2
+
+
+def _restrict_request_to_slot(request, period=1):
+    request.settings.working_days = ["Monday"]
+    for faculty in request.faculty:
+        faculty.available_days = ["Monday"]
+        faculty.available_periods = {"Monday": [period]}
+    for room in request.classrooms:
+        room.available_days = ["Monday"]
+        room.available_periods = {"Monday": [period]}
+    for lab in request.laboratories:
+        lab.available_days = ["Monday"]
+        lab.available_periods = {"Monday": [period]}
+
+
+@pytest.mark.parametrize("conflict", ["classroom", "laboratory", "faculty", "division", "batch"])
+def test_fixed_activity_blocks_matching_generated_assignment(basic_request, conflict):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    fixed = ExistingActivity(id="FIXED", day="Monday", period=1)
+
+    if conflict == "laboratory":
+        req.laboratories = [
+            Laboratory(id="L1", name="Lab 1", lab_type="CSE", capacity=40, available_days=["Monday"], available_periods={"Monday": [1, 2]}, required_subject_ids=["BLOCKED-LAB"], eligible_batches=["TB1", "TB2", "TB3"]),
+        ]
+        subject = Subject(id="BLOCKED-LAB", name="Blocked lab", code="BLOCKED-LAB", activity_type="LAB", activity_mode="WHOLE_DIVISION", weekly_periods=2, faculty_ids=["F1"], applicable_batches=["TB1", "TB2", "TB3"], required_lab_type="CSE", required_room_capacity=40)
+        fixed.laboratory_id = "L1"
+    else:
+        mode = "PARALLEL_BATCH" if conflict == "batch" else "WHOLE_DIVISION"
+        batches = ["TB2"] if conflict == "batch" else ["TB1", "TB2", "TB3"]
+        subject = Subject(id="BLOCKED", name="Blocked", code="BLOCKED", activity_type="THEORY", activity_mode=mode, weekly_periods=1, faculty_ids=["F1"], applicable_batches=batches, room_type="THEORY", required_room_capacity=60)
+        if conflict == "classroom":
+            fixed.classroom_id = "R1"
+            req.classrooms = [Classroom(id="R1", name="Room 1", room_type="THEORY", capacity=60, available_days=["Monday"], available_periods={"Monday": [1]})]
+        elif conflict == "faculty":
+            fixed.faculty_id = "F1"
+        elif conflict == "division":
+            fixed.division = req.division.id
+        elif conflict == "batch":
+            fixed.batch_ids = ["TB2"]
+
+    req.subjects = [subject]
+    req.existing_timetable = [fixed]
+    fixed_before = fixed.model_dump()
+    result = solve_basic(req)
+    assert result.status == "INFEASIBLE"
+    assert req.existing_timetable[0].model_dump() == fixed_before
+
+
+@pytest.mark.parametrize("fixed_period", [3, 4])
+def test_fixed_multiperiod_entry_blocks_every_overlapping_lab_period(basic_request, fixed_period):
+    req = basic_request.model_copy(deep=True)
+    req.settings.working_days = ["Monday"]
+    req.faculty[0].available_days = ["Monday"]
+    req.faculty[0].available_periods = {"Monday": [3, 4]}
+    req.laboratories = [
+        Laboratory(id="L1", name="Lab 1", lab_type="CSE", capacity=40, available_days=["Monday"], available_periods={"Monday": [3, 4]}, required_subject_ids=["INTERVAL-LAB"], eligible_batches=["TB1", "TB2", "TB3"]),
+    ]
+    req.subjects = [
+        Subject(id="INTERVAL-LAB", name="Interval lab", code="INTERVAL-LAB", activity_type="LAB", activity_mode="WHOLE_DIVISION", weekly_periods=2, faculty_ids=["F1"], applicable_batches=["TB1", "TB2", "TB3"], required_lab_type="CSE", required_room_capacity=40),
+    ]
+    req.existing_timetable = [
+        ExistingActivity(id="FIXED-PERIOD", day="Monday", period=fixed_period, laboratory_id="L1"),
+    ]
+    assert solve_basic(req).status == "INFEASIBLE"
+
+
+def test_replacement_requires_subject_and_faculty_eligibility_and_availability(basic_request):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    req.faculty[0].subject_ids = ["OTHER"]
+    req.faculty[1].subject_ids = ["REPLACE-ME"]
+    req.faculty[1].available_periods = {"Monday": [1]}
+    req.subjects = [
+        Subject(id="REPLACE-ME", name="Replacement", code="REPLACE-ME", activity_type="THEORY", activity_mode="WHOLE_DIVISION", weekly_periods=1, faculty_ids=["F1", "F2"], applicable_batches=["TB1", "TB2", "TB3"], room_type="THEORY", required_room_capacity=60),
+    ]
+    result = solve_basic(req)
+    assert result.status == "OPTIMAL"
+    assert len(result.activities) == 1
+    assert result.activities[0].faculty_id == "F2"
+
+
+def test_replacement_is_rejected_when_available_period_is_missing(basic_request):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    req.faculty[0].available_days = []
+    req.faculty[1].subject_ids = ["UNAVAILABLE-REPLACEMENT"]
+    req.faculty[1].available_periods = {"Monday": [2]}
+    req.subjects = [
+        Subject(id="UNAVAILABLE-REPLACEMENT", name="Unavailable", code="UNAVAILABLE-REPLACEMENT", activity_type="THEORY", activity_mode="WHOLE_DIVISION", weekly_periods=1, faculty_ids=["F1", "F2"], applicable_batches=["TB1", "TB2", "TB3"], room_type="THEORY", required_room_capacity=60),
+    ]
+    assert solve_basic(req).status == "INFEASIBLE"
+
+
+def test_replacement_is_rejected_when_workload_limit_is_exceeded(basic_request):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    req.faculty[0].available_days = []
+    req.faculty[1].subject_ids = ["OVER-LIMIT-REPLACEMENT"]
+    req.faculty[1].max_workload = 0
+    req.subjects = [
+        Subject(id="OVER-LIMIT-REPLACEMENT", name="Over limit", code="OVER-LIMIT-REPLACEMENT", activity_type="THEORY", activity_mode="WHOLE_DIVISION", weekly_periods=1, faculty_ids=["F1", "F2"], applicable_batches=["TB1", "TB2", "TB3"], room_type="THEORY", required_room_capacity=60),
+    ]
+    assert solve_basic(req).status == "INFEASIBLE"
+
+
+def test_replacement_includes_existing_fixed_faculty_workload(basic_request):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    req.faculty[0].available_days = []
+    req.faculty[1].subject_ids = ["FIXED-WORK-REPLACEMENT"]
+    req.faculty[1].max_workload = 1
+    req.existing_timetable = [
+        ExistingActivity(id="FIXED-WORK", day="Monday", period=6, faculty_id="F2", duration_periods=1),
+    ]
+    req.subjects = [
+        Subject(id="FIXED-WORK-REPLACEMENT", name="Fixed workload", code="FIXED-WORK-REPLACEMENT", activity_type="THEORY", activity_mode="WHOLE_DIVISION", weekly_periods=1, faculty_ids=["F1", "F2"], applicable_batches=["TB1", "TB2", "TB3"], room_type="THEORY", required_room_capacity=60),
+    ]
+    assert solve_basic(req).status == "INFEASIBLE"
+
+
+def test_replacement_avoids_faculty_clash_with_another_batch(basic_request):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    for faculty in req.faculty:
+        faculty.subject_ids = ["REPLACE-A", "FIXED-F2"]
+    req.subjects = [
+        Subject(id="REPLACE-A", name="Replacement A", code="REPLACE-A", activity_type="THEORY", activity_mode="PARALLEL_BATCH", weekly_periods=1, faculty_ids=["F1", "F2"], applicable_batches=["TB1"], room_type="THEORY", required_room_capacity=20),
+        Subject(id="FIXED-F2", name="Uses F2", code="FIXED-F2", activity_type="THEORY", activity_mode="PARALLEL_BATCH", weekly_periods=1, faculty_ids=["F2"], applicable_batches=["TB2"], room_type="THEORY", required_room_capacity=20),
+    ]
+    result = solve_basic(req)
+    assert result.status == "OPTIMAL"
+    selected = {activity.subject_id: activity.faculty_id for activity in result.activities}
+    assert selected == {"REPLACE-A": "F1", "FIXED-F2": "F2"}
+
+
+@pytest.mark.parametrize("conflict", ["batch", "resource"])
+def test_replacement_preserves_batch_and_resource_conflicts(basic_request, conflict):
+    req = basic_request.model_copy(deep=True)
+    _restrict_request_to_slot(req)
+    if conflict == "batch":
+        req.classrooms = [
+            Classroom(id="ROOM-A", name="Room A", room_type="THEORY", capacity=60, available_days=["Monday"], available_periods={"Monday": [1]}),
+            Classroom(id="ROOM-B", name="Room B", room_type="THEORY", capacity=60, available_days=["Monday"], available_periods={"Monday": [1]}),
+        ]
+        second_batch = "TB1"
+    else:
+        req.classrooms = [
+            Classroom(id="ONLY-ROOM", name="Only room", room_type="THEORY", capacity=60, available_days=["Monday"], available_periods={"Monday": [1]}),
+        ]
+        second_batch = "TB2"
+    req.faculty[0].subject_ids = ["REPLACEMENT-RESOURCE"]
+    req.subjects = [
+        Subject(id="REPLACEMENT-RESOURCE", name="Replacement", code="REPLACEMENT-RESOURCE", activity_type="THEORY", activity_mode="PARALLEL_BATCH", weekly_periods=1, faculty_ids=["F1"], applicable_batches=["TB1"], room_type="THEORY", required_room_capacity=20),
+        Subject(id="OTHER-BATCH", name="Other batch", code="OTHER-BATCH", activity_type="THEORY", activity_mode="PARALLEL_BATCH", weekly_periods=1, faculty_ids=["F2"], applicable_batches=[second_batch], room_type="THEORY", required_room_capacity=20),
+    ]
+    assert solve_basic(req).status == "INFEASIBLE"

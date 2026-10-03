@@ -8,7 +8,6 @@ from constraints import (
     has_break_crossing,
     is_day_available,
     is_period_available,
-    overlaps_periods,
     period_range_for_duration,
     starts_after_first_break,
 )
@@ -88,14 +87,22 @@ def _resource_available(entity, day, start_period, duration):
     )
 
 
+def _occupied_periods(start_period: int, duration_periods: int) -> set[int]:
+    return set(range(start_period, start_period + duration_periods))
+
+
 def _existing_conflicts(candidate: dict, existing_activity) -> bool:
     if not existing_activity.fixed:
         return False
     if candidate["day"] != existing_activity.day:
         return False
-    if not overlaps_periods(candidate["period"], candidate["duration_periods"], existing_activity.period, existing_activity.duration_periods):
+    candidate_periods = _occupied_periods(candidate["period"], candidate["duration_periods"])
+    existing_periods = _occupied_periods(existing_activity.period, existing_activity.duration_periods)
+    if not candidate_periods.intersection(existing_periods):
         return False
 
+    # Each identity is checked independently so sparse fixed entries still block
+    # any conflict they can establish from their populated fields.
     if candidate.get("faculty_id") and existing_activity.faculty_id and candidate["faculty_id"] == existing_activity.faculty_id:
         return True
     if candidate.get("classroom_id") and existing_activity.classroom_id and candidate["classroom_id"] == existing_activity.classroom_id:
