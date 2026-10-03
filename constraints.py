@@ -24,6 +24,21 @@ def is_day_available(available_days: Sequence[str], day: str) -> bool:
     return day in available_days
 
 
+def _time_minutes(value: str) -> float:
+    hour, minute, *seconds = map(int, value.split(":"))
+    return hour * 60 + minute + (seconds[0] / 60 if seconds else 0)
+
+
+def starts_after_first_break(start_period: int, period_timings: Sequence[dict], breaks: Sequence[dict]) -> bool:
+    if not breaks:
+        return False
+    first_break = min(breaks, key=lambda item: _time_minutes(item["start_time"]))
+    timing = next((item for item in period_timings if item.get("period") == start_period), None)
+    if timing is None:
+        return False
+    return _time_minutes(timing["start_time"]) >= _time_minutes(first_break["end_time"])
+
+
 def has_break_crossing(start_period: int, duration_periods: int, period_timings: Sequence[dict], breaks: Sequence[dict]) -> bool:
     occupied = [
         next((timing for timing in period_timings if timing.get("period") == period), None)
@@ -32,15 +47,11 @@ def has_break_crossing(start_period: int, duration_periods: int, period_timings:
     if any(timing is None for timing in occupied):
         return bool(breaks)
 
-    def minutes(value: str) -> float:
-        hour, minute, *seconds = map(int, value.split(":"))
-        return hour * 60 + minute + (seconds[0] / 60 if seconds else 0)
-
-    activity_start = minutes(occupied[0]["start_time"])
-    activity_end = minutes(occupied[-1]["end_time"])
+    activity_start = _time_minutes(occupied[0]["start_time"])
+    activity_end = _time_minutes(occupied[-1]["end_time"])
     for break_timing in breaks:
-        break_start = minutes(break_timing["start_time"])
-        break_end = minutes(break_timing["end_time"])
+        break_start = _time_minutes(break_timing["start_time"])
+        break_end = _time_minutes(break_timing["end_time"])
         if activity_start < break_end and break_start < activity_end:
             return True
     return False

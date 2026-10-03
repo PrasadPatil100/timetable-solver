@@ -10,9 +10,20 @@ from constraints import (
     is_period_available,
     overlaps_periods,
     period_range_for_duration,
+    starts_after_first_break,
 )
 from converter import convert_to_activities
 from models import GeneratedActivity, SolverRequest, SolverResult
+
+
+SOFT_WEIGHTS = {
+    "S1": 3,
+    "S2": 4,
+    "S3": 2,
+    "S4": 2,
+    "S5": 1,
+    "S6": 3,
+}
 
 
 def _lookup(items: Iterable[Any], item_id: str) -> Optional[Any]:
@@ -194,23 +205,261 @@ def _build_candidates(request: SolverRequest):
     return candidates, occurrence_to_vars, sync_groups
 
 
+def _add_s1_terms(request: SolverRequest, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.prefer_labs_after_first_break or not request.settings.breaks:
+        return []
+    period_timings = [timing.model_dump() for timing in request.settings.period_timings]
+    breaks = [break_timing.model_dump() for break_timing in request.settings.breaks]
+    return [
+        SOFT_WEIGHTS["S1"] * candidate["var"]
+        for candidate in candidates
+        if candidate["activity_type"] == "LAB"
+        and starts_after_first_break(candidate["period"], period_timings, breaks)
+    ]
+
+
+def _add_s2_terms(request: SolverRequest, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.prioritize_important_subjects:
+        return []
+    important_subject_ids = {subject.id for subject in request.subjects if subject.important}
+    if not important_subject_ids:
+        return []
+    ordered_periods = sorted(
+        request.settings.period_timings,
+        key=lambda timing: timing.start_time,
+    )
+    period_score = {
+        timing.period: len(ordered_periods) - index - 1
+        for index, timing in enumerate(ordered_periods)
+    }
+    return [
+        SOFT_WEIGHTS["S2"] * period_score.get(candidate["period"], 0) * candidate["var"]
+        for candidate in candidates
+        if candidate["subject_id"] in important_subject_ids
+    ]
+
+
+def _faculty_workload_expression(request: SolverRequest, faculty, candidates: List[dict]):
+    fixed_load = sum(
+        activity.duration_periods
+        for activity in request.existing_timetable
+        if activity.fixed and activity.faculty_id == faculty.id
+    )
+    generated_load = sum(
+        candidate["duration_periods"] * candidate["var"]
+        for candidate in candidates
+        if candidate.get("faculty_id") == faculty.id
+    )
+    return fixed_load + generated_load, fixed_load
+
+
+def _add_absolute_difference(model: cp_model.CpModel, left, right, upper_bound: int, name: str):
+    difference = model.NewIntVar(0, max(0, upper_bound), name)
+    model.AddAbsEquality(difference, left - right)
+    return difference
+
+
+def _slot_occupancies(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict]):
+    candidate_slots: Dict[Tuple[str, str, str, int], List[Any]] = {}
+    fixed_slots = set()
+
+    for candidate in candidates:
+        periods = period_range_for_duration(
+            candidate["period"], candidate["duration_periods"], request.settings.periods_per_day
+        )
+        candidate_slots.setdefault(("division", request.division.id, candidate["day"], periods[0]), [])
+        for period in periods:
+            candidate_slots.setdefault(("division", request.division.id, candidate["day"], period), []).append(candidate["var"])
+            for batch_id in candidate.get("batch_ids", []):
+                candidate_slots.setdefault(("batch", batch_id, candidate["day"], period), []).append(candidate["var"])
+            if candidate.get("faculty_id"):
+                candidate_slots.setdefault(("faculty", candidate["faculty_id"], candidate["day"], period), []).append(candidate["var"])
+
+    division_batch_ids = set(request.division.batch_ids) | {batch.id for batch in request.batches}
+    for activity in request.existing_timetable:
+        if not activity.fixed:
+            continue
+        periods = period_range_for_duration(
+            activity.period, activity.duration_periods, request.settings.periods_per_day
+        )
+        if activity.division in {request.division.id, request.division.name} or set(activity.batch_ids) & division_batch_ids:
+            fixed_slots.update(("division", request.division.id, activity.day, period) for period in periods)
+        for batch_id in set(activity.batch_ids) & division_batch_ids:
+            fixed_slots.update(("batch", batch_id, activity.day, period) for period in periods)
+        if activity.faculty_id:
+            fixed_slots.update(("faculty", activity.faculty_id, activity.day, period) for period in periods)
+
+    occupancies = {}
+    entity_ids = {
+        "division": [request.division.id],
+        "batch": sorted(division_batch_ids),
+        "faculty": [faculty.id for faculty in request.faculty],
+    }
+    for kind, identifiers in entity_ids.items():
+        for identifier in identifiers:
+            for day in request.settings.working_days:
+                for period in range(1, request.settings.periods_per_day + 1):
+                    key = (kind, identifier, day, period)
+                    variable = model.NewBoolVar(f"soft_occupied_{kind}_{identifier}_{day}_{period}")
+                    if key in fixed_slots:
+                        model.Add(variable == 1)
+                    elif candidate_slots.get(key):
+                        model.AddMaxEquality(variable, candidate_slots[key])
+                    else:
+                        model.Add(variable == 0)
+                    occupancies[key] = variable
+    return occupancies
+
+
+def _daily_load_balance_terms(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict], occupancies) -> List[Any]:
+    if not request.constraints.balance_daily_schedule or len(request.settings.working_days) < 2:
+        return []
+    terms: List[Any] = []
+    days = request.settings.working_days
+    max_workload = max((faculty.max_workload for faculty in request.faculty), default=0)
+
+    for faculty in request.faculty:
+        daily_loads = []
+        for day in days:
+            fixed_load = sum(
+                activity.duration_periods
+                for activity in request.existing_timetable
+                if activity.fixed and activity.faculty_id == faculty.id and activity.day == day
+            )
+            generated_load = sum(
+                candidate["duration_periods"] * candidate["var"]
+                for candidate in candidates
+                if candidate.get("faculty_id") == faculty.id and candidate["day"] == day
+            )
+            daily_loads.append(fixed_load + generated_load)
+        for left_index, left in enumerate(daily_loads):
+            for right_index, right in enumerate(daily_loads[left_index + 1:], left_index + 1):
+                difference = _add_absolute_difference(
+                    model, left, right, max_workload, f"soft_faculty_day_diff_{faculty.id}_{left_index}_{right_index}"
+                )
+                terms.append(-SOFT_WEIGHTS["S4"] * difference)
+
+    entities = [("division", request.division.id)]
+    entities.extend(("batch", batch_id) for batch_id in sorted({batch.id for batch in request.batches} | set(request.division.batch_ids)))
+    for kind, identifier in entities:
+        daily_loads = [
+            sum(
+                occupancies[(kind, identifier, day, period)]
+                for period in range(1, request.settings.periods_per_day + 1)
+            )
+            for day in days
+        ]
+        for left_index, left in enumerate(daily_loads):
+            for right_index, right in enumerate(daily_loads[left_index + 1:], left_index + 1):
+                difference = _add_absolute_difference(
+                    model,
+                    left,
+                    right,
+                    request.settings.periods_per_day,
+                    f"soft_{kind}_day_diff_{identifier}_{left_index}_{right_index}",
+                )
+                terms.append(-SOFT_WEIGHTS["S4"] * difference)
+    return terms
+
+
+def _add_s3_terms(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.balance_faculty_workload or len(request.faculty) < 2:
+        return []
+    loads = []
+    bounds = []
+    for faculty in request.faculty:
+        load, fixed_load = _faculty_workload_expression(request, faculty, candidates)
+        loads.append((faculty, load))
+        bounds.append(max(faculty.max_workload, fixed_load))
+    upper_bound = max(bounds, default=0)
+    terms = []
+    for left_index, (left_faculty, left_load) in enumerate(loads):
+        for right_index, (right_faculty, right_load) in enumerate(loads[left_index + 1:], left_index + 1):
+            difference = _add_absolute_difference(
+                model,
+                left_load,
+                right_load,
+                upper_bound,
+                f"soft_faculty_total_diff_{left_faculty.id}_{right_faculty.id}",
+            )
+            terms.append(-SOFT_WEIGHTS["S3"] * difference)
+    return terms
+
+
+def _add_s4_terms(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.balance_daily_schedule or len(request.settings.working_days) < 2:
+        return []
+    occupancies = _slot_occupancies(request, model, candidates)
+    return _daily_load_balance_terms(request, model, candidates, occupancies)
+
+
+def _add_s5_terms(request: SolverRequest, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.efficient_resource_utilization:
+        return []
+    resources = {resource.id: resource for resource in request.classrooms + request.laboratories}
+    subjects = {subject.id: subject for subject in request.subjects}
+    batch_sizes = {batch.id: batch.number_of_students or 0 for batch in request.batches}
+    terms = []
+    for candidate in candidates:
+        resource_id = candidate.get("classroom_id") or candidate.get("laboratory_id")
+        resource = resources.get(resource_id)
+        subject = subjects.get(candidate["subject_id"])
+        if resource is None or subject is None:
+            continue
+        assigned_students = sum(batch_sizes.get(batch_id, 0) for batch_id in candidate.get("batch_ids", []))
+        if candidate["activity_mode"] == "WHOLE_DIVISION":
+            assigned_students = max(assigned_students, request.division.number_of_students)
+        required_capacity = max(subject.required_room_capacity or 0, assigned_students)
+        excess_capacity = max(0, resource.capacity - required_capacity)
+        excess_units = min(20, excess_capacity)
+        terms.append(-SOFT_WEIGHTS["S5"] * excess_units * candidate["var"])
+    return terms
+
+
+def _add_s6_terms(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict]) -> List[Any]:
+    if not request.constraints.minimize_unnecessary_gaps:
+        return []
+    occupancies = _slot_occupancies(request, model, candidates)
+    entities = [("division", request.division.id)]
+    entities.extend(("batch", batch_id) for batch_id in sorted({batch.id for batch in request.batches} | set(request.division.batch_ids)))
+    entities.extend(("faculty", faculty.id) for faculty in request.faculty)
+    terms = []
+    period_count = request.settings.periods_per_day
+    for kind, identifier in entities:
+        for day in request.settings.working_days:
+            day_slots = [
+                occupancies[(kind, identifier, day, period)]
+                for period in range(1, period_count + 1)
+            ]
+            for period in range(1, period_count - 1):
+                before = model.NewBoolVar(f"soft_before_{kind}_{identifier}_{day}_{period}")
+                after = model.NewBoolVar(f"soft_after_{kind}_{identifier}_{day}_{period}")
+                model.AddMaxEquality(before, day_slots[:period])
+                model.AddMaxEquality(after, day_slots[period + 1:])
+                gap = model.NewBoolVar(f"soft_gap_{kind}_{identifier}_{day}_{period + 1}")
+                model.AddBoolAnd([before, after, day_slots[period].Not()]).OnlyEnforceIf(gap)
+                model.AddBoolOr([before.Not(), after.Not(), day_slots[period]]).OnlyEnforceIf(gap.Not())
+                terms.append(-SOFT_WEIGHTS["S6"] * gap)
+    return terms
+
+
+def _build_soft_objective(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict]) -> List[Any]:
+    terms = []
+    terms.extend(_add_s1_terms(request, candidates))
+    terms.extend(_add_s2_terms(request, candidates))
+    terms.extend(_add_s3_terms(request, model, candidates))
+    terms.extend(_add_s4_terms(request, model, candidates))
+    terms.extend(_add_s5_terms(request, candidates))
+    terms.extend(_add_s6_terms(request, model, candidates))
+    return terms
+
+
 def _add_constraints(request: SolverRequest, model: cp_model.CpModel, candidates: List[dict], occurrence_to_vars: Dict[str, List[Any]], sync_groups: Dict[str, List[str]]) -> tuple[dict, bool]:
     bool_vars: Dict[str, Any] = {}
-    objective_terms: List[Any] = []
     for candidate in candidates:
         variable = model.NewBoolVar(candidate["candidate_id"])
         bool_vars[candidate["candidate_id"]] = variable
         candidate["var"] = variable
-
-        # Soft preference: important subjects and labs after the first break are preferred.
-        if request.settings.breaks:
-            late_lab_preference = 1 if candidate["activity_type"] == "LAB" and candidate["period"] >= 3 else 0
-        else:
-            late_lab_preference = 0
-        if candidate["subject_id"] and any(sub.id == candidate["subject_id"] and sub.important for sub in request.subjects):
-            objective_terms.append(5 * variable)
-        if late_lab_preference:
-            objective_terms.append(2 * variable)
 
     for occurrence_id, selected in occurrence_to_vars.items():
         if not selected:
@@ -301,7 +550,8 @@ def _add_constraints(request: SolverRequest, model: cp_model.CpModel, candidates
             <= faculty.max_workload
         )
 
-    # Exact weekly workload is maintained by exactly-one per occurrence; no fake backfilling is introduced.
+    # Required occurrences remain mandatory; these terms only choose among hard-feasible candidates.
+    objective_terms = _build_soft_objective(request, model, candidates)
     if objective_terms:
         model.Maximize(sum(objective_terms))
 
